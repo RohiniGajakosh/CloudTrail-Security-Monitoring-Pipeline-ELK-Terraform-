@@ -71,7 +71,7 @@ jobs:
         # so the apply job can download and use it
         with:
           name: tfplan
-          path: tfplan
+          path: ./tfplan
   
   # ============================================================
   # JOB 3 — Apply: actually create/update infrastructure
@@ -101,6 +101,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: tfplan
-          path: tfplan
+          path: .
       - name: Terraform apply
         run: terraform apply --auto-approve tfplan
