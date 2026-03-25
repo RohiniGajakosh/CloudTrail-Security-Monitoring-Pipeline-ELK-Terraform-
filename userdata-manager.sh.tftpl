@@ -198,15 +198,15 @@ sleep 10   # extra buffer for worker nodes to fully register
 #   Worker 0 → role=kibana
 #   Worker 1 → role=logstash
 WORKER_IDS=($(docker node ls --filter "role=worker" --format "{{.ID}}"))
-echo "Worker IDs found: ${WORKER_IDS[*]:-none}"
+echo "Worker IDs found: $${WORKER_IDS[*]:-none}"
 
-if [ "${#WORKER_IDS[@]}" -ge 1 ]; then
-  docker node update --label-add role=kibana "${WORKER_IDS[0]}"
-  echo "Labelled ${WORKER_IDS[0]} -> role=kibana"
+if [ "$${#WORKER_IDS[@]}" -ge 1 ]; then
+  docker node update --label-add role=kibana "$${WORKER_IDS[0]}"
+  echo "Labelled $${WORKER_IDS[0]} -> role=kibana"
 fi
-if [ "${#WORKER_IDS[@]}" -ge 2 ]; then
-  docker node update --label-add role=logstash "${WORKER_IDS[1]}"
-  echo "Labelled ${WORKER_IDS[1]} -> role=logstash"
+if [ "$${#WORKER_IDS[@]}" -ge 2 ]; then
+  docker node update --label-add role=logstash "$${WORKER_IDS[1]}"
+  echo "Labelled $${WORKER_IDS[1]} -> role=logstash"
 fi
 
 # =============================================================================
@@ -268,13 +268,13 @@ output {
   if "cloudtrail" in [tags] {
     elasticsearch {
       hosts => ["http://elasticsearch:9200"]
-      index => "cloudtrail-logs-%{+YYYY.MM.dd}"
+      index => "cloudtrail-logs-%%{+YYYY.MM.dd}"
     }
   }
   if "custom_dashboard" in [tags] {
     elasticsearch {
       hosts => ["http://elasticsearch:9200"]
-      index => "custom-dashboard-logs-%{+YYYY.MM.dd}"
+      index => "custom-dashboard-logs-%%{+YYYY.MM.dd}"
     }
   }
   stdout { codec => rubydebug }

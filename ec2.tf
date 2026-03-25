@@ -36,9 +36,9 @@ resource "aws_instance" "swarm_worker" {
 
   # Pass manager private IP and worker index so each worker
   # knows where to join and what label to request
-  user_data = templatefile("${path.module}/userdata-worker.sh.tftpl", {
+  user_data = templatefile("${path.module}/user-data-worker.sh.tftpl", {
     manager_private_ip = aws_instance.swarm_manager.private_ip
-    worker_index       = count.index  # 0 → kibana, 1 → logstash
+    worker_index       = count.index # 0 → kibana, 1 → logstash
   })
 
   # Workers must start AFTER the manager so the SSM parameter
