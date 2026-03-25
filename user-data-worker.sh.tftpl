@@ -1,0 +1,124 @@
+#!/bin/bash
+# =============================================================================
+# WORKER NODE USERDATA — Template file (.tftpl)
+# =============================================================================
+# This file has a .tftpl extension because it is a Terraform template.
+# When Terraform reads this file using templatefile(), it replaces any
+# ${variable_name} placeholders with real values before sending the script
+# to the EC2 instance.
+#
+# Two placeholders are injected from ec2.tf:
+#   ${manager_private_ip} → the private IP of the manager EC2 instance
+#   ${worker_index}       → 0 for the first worker, 1 for the second
+#
+# This means each of the 2 workers gets a SLIGHTLY DIFFERENT version of this
+# script, even though they share the same template file.
+# =============================================================================
+exec > /var/log/elk-worker-setup.log 2>&1
+set -uxo pipefail
+
+echo "====== ELK Worker-${worker_index} Setup Started: $(date) ======"
+
+# =============================================================================
+# STEP 1 — Install required software (same as manager)
+# =============================================================================
+yum update -y
+yum install -y docker git
+systemctl enable docker
+systemctl start docker
+sleep 5
+
+# =============================================================================
+# STEP 2 — Elasticsearch kernel setting
+# =============================================================================
+# Set on ALL nodes, not just the one running Elasticsearch.
+# This is because the placement might change, and it's a good OS hygiene setting.
+echo "vm.max_map_count=262144" >> /etc/sysctl.conf
+sysctl -w vm.max_map_count=262144
+
+# =============================================================================
+# STEP 3 — Create directories for Docker volume mounts
+# =============================================================================
+# Kibana and Logstash services (which run on workers) need these directories
+# to exist on the HOST before their containers start. Swarm doesn't create them.
+mkdir -p /home/ec2-user/logstash/manual-logs
+mkdir -p /home/ec2-user/datasets
+mkdir -p /home/ec2-user/kibana
+
+cat > /home/ec2-user/kibana/kibana.yml <<'EOF'
+server.host: "0.0.0.0"
+server.name: "kibana"
+elasticsearch.hosts: ["http://elasticsearch:9200"]
+telemetry.enabled: false
+xpack.security.enabled: false
+EOF
+
+touch /home/ec2-user/logstash/manual-logs/dummy-logs.json
+chown -R ec2-user:ec2-user /home/ec2-user/logstash \
+                            /home/ec2-user/datasets \
+                            /home/ec2-user/kibana
+
+# =============================================================================
+# STEP 4 — Poll SSM until the manager publishes the join token
+# =============================================================================
+# The manager and workers boot at roughly the same time. The manager needs
+# several minutes to install Docker, init the swarm, and publish the token.
+# Workers must wait and keep checking SSM until the token is available.
+#
+# This is a polling loop:
+#   - Try to fetch the token from SSM
+#   - If empty or not yet created, wait 10 seconds and try again
+#   - Abort after 10 minutes (60 attempts) if still nothing
+REGION="ap-south-1"
+
+# This value is injected by Terraform's templatefile() function.
+# When Terraform processes this file, "${manager_private_ip}" gets replaced
+# with the actual private IP of the manager EC2 instance.
+MANAGER_IP="${manager_private_ip}"
+
+TOKEN=""
+echo "Waiting for SSM join token (manager may still be initializing)..."
+
+for i in $(seq 1 60); do
+  TOKEN=$(aws ssm get-parameter \
+    --name "/elk-swarm/worker-join-token" \
+    --with-decryption \
+    --query "Parameter.Value" \
+    --output text \
+    --region "$REGION" 2>/dev/null || true)
+  # 2>/dev/null suppresses error output if the parameter doesn't exist yet
+  # || true prevents set -o pipefail from killing the script on SSM 404
+
+  if [ -n "$TOKEN" ] && [ "$TOKEN" != "None" ]; then
+    echo "Join token received on attempt $i."
+    break
+  fi
+  echo "[$(date)] Token not available yet ($i/60). Retrying in 10s..."
+  sleep 10
+done
+
+if [ -z "$TOKEN" ] || [ "$TOKEN" = "None" ]; then
+  echo "ERROR: Could not retrieve join token after 10 minutes. Aborting."
+  exit 1
+fi
+
+# =============================================================================
+# STEP 5 — Join the Docker Swarm
+# =============================================================================
+# With the token and manager IP, this worker can now officially join the swarm.
+# After this command succeeds, the manager will see this node in: docker node ls
+if ! docker info --format '{{.Swarm.LocalNodeState}}' | grep -q active; then
+  docker swarm join --token "$TOKEN" "$MANAGER_IP:2377"
+  # Port 2377 is the standard Docker Swarm manager control plane port
+  echo "Successfully joined swarm at $MANAGER_IP:2377"
+else
+  echo "Already in a swarm, skipping join."
+fi
+
+# At this point:
+# - The worker is in the swarm
+# - The MANAGER script (step 9-10) will detect this worker, label it,
+#   and eventually deploy the stack
+# Workers don't deploy the stack — only the manager does that.
+
+echo "====== ELK Worker-${worker_index} Setup Complete: $(date) ======"

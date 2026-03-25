@@ -1,0 +1,131 @@
+version: '3.8'
+configs:
+  logstash_conf_v2:
+    file: ./cloudtrail-s3.conf
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    environment:
+      discovery.type: single-node
+      xpack.ml.enabled: 'false'
+      xpack.watcher.enabled: 'false'
+      xpack.monitoring.collection.enabled: 'false'
+      ingest.geoip.downloader.enabled: 'false'
+      ES_JAVA_OPTS: -Xms256m -Xmx256m
+      xpack.security.enabled: 'false'
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    networks:
+    - elk
+    volumes:
+    - esdata:/usr/share/elasticsearch/data
+    ports:
+    - target: 9200
+      published: 9200
+      protocol: tcp
+      mode: host
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -fs http://localhost:9200/_cluster/health || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+        - node.labels.role == elasticsearch
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 768M
+        reservations:
+          cpus: '0.25'
+          memory: 384M
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.0
+    volumes:
+      - /home/ec2-user/kibana/kibana.yml:/usr/share/kibana/config/kibana.yml
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      TELEMETRY_ENABLED: 'false'
+      SERVER_HOST: 0.0.0.0
+      SERVER_NAME: kibana
+      NODE_OPTIONS: --max-old-space-size=768
+      XPACK_SECURITY_ENABLED: 'false'
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: k8sT3rr4f0rmELKst4ckD3pl0ym3ntK3y
+    networks:
+    - elk
+    ports:
+    - target: 5601
+      published: 5601
+      protocol: tcp
+      mode: host
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -fs http://localhost:5601/api/status || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+        - node.labels.role == kibana
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+      resources:
+        limits:
+          cpus: '1.00'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.12.0
+    environment:
+      AWS_DEFAULT_REGION: ap-south-1
+      LS_JAVA_OPTS: -Xms768m -Xmx768m
+      PIPELINE_WORKERS: '1'
+      MONITORING_ENABLED: 'false'
+    networks:
+    - elk
+    configs:
+    - source: logstash_conf_v2
+      target: /usr/share/logstash/pipeline/logstash.conf
+      mode: 292
+    volumes:
+    - logstashdata:/usr/share/logstash/data
+    - /home/ec2-user/logstash/manual-logs:/usr/share/logstash/manual-logs
+    - /home/ec2-user/datasets:/datasets
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+        - node.labels.role == logstash
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 1G
+        reservations:
+          cpus: '0.10'
+          memory: 512M
+networks:
+  elk:
+    driver: overlay
+volumes:
+   esdata:
+   logstashdata:

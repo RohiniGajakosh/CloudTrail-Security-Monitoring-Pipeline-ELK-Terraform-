@@ -1,0 +1,298 @@
+#!/bin/bash
+# =============================================================================
+# MANAGER NODE USERDATA
+# This script runs ONCE automatically when the EC2 instance first boots.
+# It is run as ROOT by cloud-init (AWS's boot automation system).
+# All output is saved to /var/log/elk-manager-setup.log so you can
+# debug it later with: sudo cat /var/log/elk-manager-setup.log
+# =============================================================================
+exec > /var/log/elk-manager-setup.log 2>&1
+
+# set -u  = error if any variable is used before being set (catches typos)
+# set -x  = print every command before running it (great for debugging)
+# set -o pipefail = if any command in a pipe fails, the whole pipe fails
+# NOTE: we intentionally leave out -e (exit on error) so the script doesn't
+# silently die on small errors. We handle critical errors ourselves below.
+set -uxo pipefail
+
+echo "====== ELK Manager Setup Started: $(date) ======"
+
+# =============================================================================
+# STEP 1 — Install required software
+# =============================================================================
+yum update -y                          # update all existing packages
+yum install -y docker git              # install docker and git
+
+systemctl enable docker   # make docker start automatically on every reboot
+systemctl start docker    # start docker right now
+sleep 5                   # wait 5 seconds for docker daemon to be fully ready
+
+# =============================================================================
+# STEP 2 — Elasticsearch kernel setting (CRITICAL — without this ES crashes)
+# =============================================================================
+# Elasticsearch needs the OS to allow at least 262144 virtual memory areas.
+# The default on Amazon Linux is only 65530, which makes ES refuse to start.
+echo "vm.max_map_count=262144" >> /etc/sysctl.conf   # persist across reboots
+sysctl -w vm.max_map_count=262144                     # apply right now without reboot
+
+# =============================================================================
+# STEP 3 — Get this instance's private IP (using IMDSv2)
+# =============================================================================
+# Amazon Linux 2023 enforces IMDSv2 (a more secure metadata API).
+# Old method (IMDSv1): curl http://169.254.169.254/latest/meta-data/local-ipv4
+#   → Returns EMPTY on AL2023. This was the bug that broke the previous version.
+#
+# IMDSv2 requires a two-step process:
+#   Step A: Get a short-lived session token (valid 60 seconds)
+#   Step B: Use that token in the actual metadata request
+IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+
+PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/local-ipv4)
+
+echo "Manager private IP: $PRIVATE_IP"
+
+# Safety check — if IP is still empty, something is very wrong, abort now
+if [ -z "$PRIVATE_IP" ]; then
+  echo "ERROR: Could not determine private IP. Aborting."
+  exit 1
+fi
+
+# =============================================================================
+# STEP 4 — Clone your project from GitHub
+# =============================================================================
+cd /home/ec2-user
+if [ ! -d app ]; then   # only clone if the folder doesn't already exist
+  git clone https://github.com/RohiniGajakosh/CloudTrail-Security-Monitoring-Pipeline-ELK-Terraform-.git app
+fi
+chown -R ec2-user:ec2-user /home/ec2-user/app   # fix ownership (root ran the clone)
+
+# =============================================================================
+# STEP 5 — Create directories that the Docker containers will mount
+# =============================================================================
+# Your docker-stack.yml has "volumes:" sections that mount host directories
+# INTO containers. If these directories don't exist on the host, Docker Swarm
+# will silently fail to start the service.
+#
+# These three mounts are in docker-stack.yml:
+#   /home/ec2-user/kibana/kibana.yml   → mounted into Kibana container
+#   /home/ec2-user/logstash/manual-logs/ → mounted into Logstash container
+#   /home/ec2-user/datasets/           → mounted into Logstash container
+mkdir -p /home/ec2-user/logstash/manual-logs
+mkdir -p /home/ec2-user/datasets
+mkdir -p /home/ec2-user/kibana
+
+# Create a minimal kibana.yml config file that Kibana reads on startup
+cat > /home/ec2-user/kibana/kibana.yml <<'EOF'
+server.host: "0.0.0.0"
+server.name: "kibana"
+elasticsearch.hosts: ["http://elasticsearch:9200"]
+telemetry.enabled: false
+xpack.security.enabled: false
+EOF
+
+# Create an empty dummy JSON log file so the Logstash file input plugin
+# doesn't crash on startup because the file doesn't exist
+touch /home/ec2-user/logstash/manual-logs/dummy-logs.json
+
+# Fix ownership for all created dirs
+chown -R ec2-user:ec2-user /home/ec2-user/logstash \
+                            /home/ec2-user/datasets \
+                            /home/ec2-user/kibana
+
+# =============================================================================
+# STEP 6 — Initialize the Docker Swarm
+# =============================================================================
+# Docker Swarm is Docker's built-in clustering system. One node acts as the
+# "manager" (brain) and the rest are "workers". The manager decides which
+# container runs on which node based on placement constraints.
+#
+# --advertise-addr tells other nodes which IP to reach this manager on.
+# Without it Docker would pick a random interface, which may not be routable.
+if ! docker info --format '{{.Swarm.LocalNodeState}}' | grep -q active; then
+  docker swarm init --advertise-addr "$PRIVATE_IP"
+  echo "Swarm initialized."
+else
+  echo "Already in swarm, skipping init."
+fi
+
+# =============================================================================
+# STEP 7 — Share the join token with worker nodes via AWS SSM
+# =============================================================================
+# When a worker wants to join the swarm, it needs a secret "join token" that
+# proves it's allowed to join. The manager generates this token.
+#
+# Problem: how does the worker get the token? Workers boot at the same time
+# as the manager — we can't hardcode the token in Terraform because it doesn't
+# exist yet at plan time.
+#
+# Solution: Store the token in AWS SSM Parameter Store (a secure key-value store).
+# Workers will poll SSM until the token appears, then use it to join.
+WORKER_TOKEN=$(docker swarm join-token -q worker)   # -q = quiet, just the token
+REGION="ap-south-1"
+
+# Put the join token as a SecureString (encrypted at rest with KMS)
+aws ssm put-parameter \
+  --name "/elk-swarm/worker-join-token" \
+  --value "$WORKER_TOKEN" \
+  --type "SecureString" \
+  --overwrite \
+  --region "$REGION"
+
+# Also store the manager IP so workers know WHERE to connect
+aws ssm put-parameter \
+  --name "/elk-swarm/manager-private-ip" \
+  --value "$PRIVATE_IP" \
+  --type "String" \
+  --overwrite \
+  --region "$REGION"
+
+echo "SSM parameters published."
+
+# =============================================================================
+# STEP 8 — Label this manager node
+# =============================================================================
+# Your docker-stack.yml has placement constraints like:
+#   constraints: [node.labels.role == elasticsearch]
+# This means Elasticsearch will ONLY run on a node labelled role=elasticsearch.
+# Without labels, Docker Swarm won't know where to place each service.
+#
+# The manager runs Elasticsearch (it's the beefiest node conceptually).
+# Workers will run Kibana and Logstash.
+SELF_NODE_ID=$(docker info --format '{{.Swarm.NodeID}}')
+docker node update --label-add role=elasticsearch "$SELF_NODE_ID"
+echo "Manager labelled: role=elasticsearch (NodeID: $SELF_NODE_ID)"
+
+# =============================================================================
+# STEP 9 — Wait for both workers to join the swarm
+# =============================================================================
+# Workers are booting in parallel. We need to wait until all 3 nodes (1 manager
+# + 2 workers) are visible before we can label the workers and deploy the stack.
+echo "Waiting for 3 total nodes..."
+MAX_WAIT=60   # 60 attempts × 10 seconds = 10 minutes max wait
+COUNT=0
+while true; do
+  NODE_COUNT=$(docker node ls -q | wc -l)
+  echo "[$(date)] Nodes in swarm: $NODE_COUNT / 3"
+  if [ "$NODE_COUNT" -ge 3 ]; then
+    echo "All 3 nodes present."
+    break
+  fi
+  COUNT=$((COUNT + 1))
+  if [ "$COUNT" -ge "$MAX_WAIT" ]; then
+    echo "WARNING: Timed out waiting for workers. Proceeding with $NODE_COUNT node(s)."
+    break
+  fi
+  sleep 10
+done
+
+sleep 10   # extra buffer for worker nodes to fully register
+
+# =============================================================================
+# STEP 10 — Label the worker nodes
+# =============================================================================
+# Now that workers have joined, label them so placement constraints work.
+# Workers join in the order they boot. Since Terraform creates worker 0 first
+# (count.index=0), it will typically join before worker 1.
+#   Worker 0 → role=kibana
+#   Worker 1 → role=logstash
+WORKER_IDS=($(docker node ls --filter "role=worker" --format "{{.ID}}"))
+echo "Worker IDs found: ${WORKER_IDS[*]:-none}"
+
+if [ "${#WORKER_IDS[@]}" -ge 1 ]; then
+  docker node update --label-add role=kibana "${WORKER_IDS[0]}"
+  echo "Labelled ${WORKER_IDS[0]} -> role=kibana"
+fi
+if [ "${#WORKER_IDS[@]}" -ge 2 ]; then
+  docker node update --label-add role=logstash "${WORKER_IDS[1]}"
+  echo "Labelled ${WORKER_IDS[1]} -> role=logstash"
+fi
+
+# =============================================================================
+# STEP 11 — Deploy the ELK stack
+# =============================================================================
+# docker stack deploy reads docker-stack.yml and creates all the services
+# (elasticsearch, kibana, logstash) across the swarm. Docker Swarm then
+# schedules each service on the correctly labelled node.
+APP_DIR="/home/ec2-user/app/elk"
+if [ ! -f "$APP_DIR/docker-stack.yml" ]; then
+  echo "ERROR: docker-stack.yml not found at $APP_DIR — check your git repo structure"
+  find /home/ec2-user/app -name "*.yml" | head -20
+  exit 1
+fi
+
+cd "$APP_DIR"
+
+# Write the rendered Logstash config with the real bucket name.
+# Terraform already substituted ${bucket_name} in this script before it
+# reached the instance, so we just echo the final value into the conf file.
+# The docker-stack.yml mounts this conf into the Logstash container via
+# a Docker config object (the 'configs:' section in docker-stack.yml).
+cat > /home/ec2-user/app/elk/cloudtrail-s3.conf << 'LOGSTASH_CONF'
+input {
+  s3 {
+    id       => "cloudtrail_s3"
+    bucket   => "${bucket_name}"
+    region   => "ap-south-1"
+    prefix   => "AWSLogs/"
+    sincedb_path => "/usr/share/logstash/data/sincedb"
+    codec    => "json"
+    interval => 120
+    tags     => ["cloudtrail"]
+  }
+  file {
+    id             => "custom-manual-logs"
+    path           => "/usr/share/logstash/manual-logs/dummy-logs.json"
+    start_position => "beginning"
+    sincedb_path   => "/dev/null"
+    codec          => "json"
+    tags           => ["custom_dashboard"]
+  }
+}
+filter {
+  if "cloudtrail" in [tags] {
+    if [Records] {
+      split { field => "Records" }
+      mutate {
+        rename    => { "[Records]" => "[event]" }
+        add_field => { "data_source" => "cloudtrail" }
+      }
+    }
+  }
+  if "custom_dashboard" in [tags] {
+    mutate { add_field => { "data_source" => "custom_dashboard" } }
+  }
+}
+output {
+  if "cloudtrail" in [tags] {
+    elasticsearch {
+      hosts => ["http://elasticsearch:9200"]
+      index => "cloudtrail-logs-%{+YYYY.MM.dd}"
+    }
+  }
+  if "custom_dashboard" in [tags] {
+    elasticsearch {
+      hosts => ["http://elasticsearch:9200"]
+      index => "custom-dashboard-logs-%{+YYYY.MM.dd}"
+    }
+  }
+  stdout { codec => rubydebug }
+}
+LOGSTASH_CONF
+
+docker stack deploy -c docker-stack.yml elk
+echo "Stack deployed."
+
+# =============================================================================
+# STEP 12 — Print final status so you can see the result in the log
+# =============================================================================
+sleep 20
+echo ""
+echo "====== Final Swarm State ======"
+docker node ls
+echo ""
+echo "====== Running Services ======"
+docker service ls
+echo ""
+echo "====== ELK Manager Setup Complete: $(date) ======"

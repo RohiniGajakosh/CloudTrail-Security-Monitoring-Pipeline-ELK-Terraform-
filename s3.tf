@@ -2,7 +2,7 @@ resource "aws_s3_bucket" "cloudtrail_logs" {
   bucket = "cloudtrail-logs-bucket-123456789"
   tags = {
     Name = "CloudTrail Logs Bucket"
-  } 
+  }
 }
 
 resource "aws_s3_bucket_policy" "cloudtrail_policy" {
